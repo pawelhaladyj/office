@@ -12,6 +12,10 @@ ENV/
 .env.*
 !.env.example          # zostaw wzorzec w repo
 
+# __Notatki _____________________________________________________
+
+notes.txt
+
 # ── Dystrybucja / pakowanie ────────────────────────────────────
 build/
 dist/

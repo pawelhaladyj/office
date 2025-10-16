@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+import os
+import asyncio
+import logging
+from dotenv import load_dotenv
+
+from agents.coordinator import CoordinatorAgent
+from agents.provider_bakery import ProviderAgent
+from agents.reporter import ReporterAgent
+from agents.explorer_ai import ExplorerAgent
+
+
+# --- Logowanie „po staremu” ---
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+
+# --- Pomocnicze funkcje do pobierania JID/PWD z .env ---
+def jid(name: str) -> str:
+    return os.getenv(f"JID_{name.upper()}")
+
+
+def pwd(name: str) -> str:
+    return os.getenv(f"PWD_{name.upper()}")
+
+
+async def main():
+    load_dotenv()
+
+    # --- Tworzenie agentów ---
+    coord = CoordinatorAgent(jid("coordinator"), pwd("coordinator"))
+    prov = ProviderAgent(jid("provider"), pwd("provider"))
+    rep = ReporterAgent(jid("reporter"), pwd("reporter"))
+    expl = ExplorerAgent(jid("explorer"), pwd("explorer"))
+
+    # --- Konfiguracja XMPP host/port/STARTTLS PRZED start() ---
+    xmpp_host = os.getenv("XMPP_HOST", "85.215.177.75")
+    xmpp_port = int(os.getenv("XMPP_PORT", "5222"))
+
+    for a in (coord, prov, rep, expl):
+        a.xmpp_host = xmpp_host
+        a.xmpp_port = xmpp_port
+        a.use_ssl = True             # ✳️ Nie używamy natychmiastowego SSL
+        a.force_starttls = False       # ✳️ STARTTLS (negocjacja połączenia)
+        a.disable_starttls = True
+        a.verify_security = False     # ✳️ DEV: bez weryfikacji certu
+
+    # --- Explorer wie, kto jest koordynatorem ---
+    expl.config = {"coordinator": jid("coordinator")}
+
+    # --- Start agentów ---
+    await coord.start()
+    await prov.start()
+    await rep.start()
+    await expl.start()
+
+    print("✅ Agents up and running. Ctrl+C to stop.")
+    # utrzymanie pętli
+    await asyncio.Future()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n🛑 Stopped by user.")
