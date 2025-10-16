@@ -1,0 +1,44 @@
+# ── Python bytecode ─────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ── Środowiska / sekrety ───────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+.env
+.env.*
+!.env.example          # zostaw wzorzec w repo
+
+# ── Dystrybucja / pakowanie ────────────────────────────────────
+build/
+dist/
+*.egg-info/
+.eggs/
+wheels/
+*.egg
+MANIFEST
+
+# ── Testy / coverage / cache ───────────────────────────────────
+.tox/
+.nox/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.cache/
+.hypothesis/
+.mypy_cache/
+.pytype/
+.pyre/
+.ruff_cache/
+
+# ── Edytory / IDE ──────────────────────────────────────────────
+.vscode/
+.idea/
+
+# ── Notatniki / dokumentacja ───────────────────────────────────
+.ipynb_checkpoints/
+docs/_build/
