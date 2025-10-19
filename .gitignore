@@ -46,3 +46,6 @@ htmlcov/
 # ── Notatniki / dokumentacja ───────────────────────────────────
 .ipynb_checkpoints/
 docs/_build/
+
+# __ Zapis Rozmowy ______________________________________________
+out/

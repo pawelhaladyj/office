@@ -1,7 +1,7 @@
 import sys
-from agents.base import BaseACLAgent
+from common.base import BaseACLAgent
 from common.acl import AclMessage
-from ai.llm import suggest
+from common.llm import suggest
 
 class ExplorerAgent(BaseACLAgent):
     async def on_start(self):

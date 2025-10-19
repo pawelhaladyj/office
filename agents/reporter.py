@@ -1,12 +1,34 @@
-import pathlib, json, datetime
-from agents.base import BaseACLAgent
-from common.acl import AclMessage
+# agents/reporter.py (fragment)
+import os, json, time, logging
+from spade.agent import Agent
+from spade.behaviour import CyclicBehaviour
+from spade.template import Template
+from common.fipa import conv_id, protocol, perf
 
-OUT = pathlib.Path("out"); OUT.mkdir(exist_ok=True)
+OUTDIR = "out"
+os.makedirs(OUTDIR, exist_ok=True)
 
-class ReporterAgent(BaseACLAgent):
-    async def handle_acl(self, acl: AclMessage, sender: str):
-        if acl.performative=="INFORM" and acl.payload.get("type")=="AUDIT":
-            ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-            (OUT/f"{acl.conversation_id}-{ts}.json").write_text(json.dumps(acl.payload, indent=2))
-            print("[report] zapisano ofertę")
+class ReporterAgent(Agent):
+    async def setup(self):
+        self.add_behaviour(self.AuditSink(), Template())  # łapie wszystkie
+
+    class AuditSink(CyclicBehaviour):
+        async def run(self):
+            msg = await self.receive(timeout=10)
+            if not msg:
+                return
+            rec = {
+                "ts": int(time.time()),
+                "from": str(msg.sender),
+                "to": str(msg.to),
+                "performative": perf(msg),
+                "protocol": protocol(msg),
+                "conversation_id": conv_id(msg),
+                "body": msg.body,
+                "metadata": dict(msg.metadata or {}),
+            }
+            path = os.path.join(OUTDIR, f"audit-{rec['ts']}-{rec['conversation_id']}.json")
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            logging.info("[reporter] zapisano audyt: %s", os.path.basename(path))
+
