@@ -3,3 +3,5 @@ python-dotenv>=1.0
 pydantic>=2.8
 httpx>=0.27
 openai>=1.43  # opcjonalnie; jak brak klucza – fallback
+slixmpp==1.11.0
+python-dotenv==1.0.1

@@ -1,4 +1,27 @@
 #!/usr/bin/env python3
+# ========================================
+# Monkey patch: zgodność SPADE 4.0.3 + Slixmpp 1.11.x
+# (musi być przed importem SPADE / agentów)
+# ========================================
+import inspect
+import slixmpp.clientxmpp as _cx
+
+if "address" not in inspect.signature(_cx.ClientXMPP.connect).parameters:
+    _orig_connect = _cx.ClientXMPP.connect
+
+    def _patched_connect(self, *args, **kwargs):
+        if "address" in kwargs and isinstance(kwargs["address"], (tuple, list)):
+            host, port = kwargs.pop("address")
+            kwargs.setdefault("host", host)
+            kwargs.setdefault("port", port)
+        return _orig_connect(self, *args, **kwargs)
+
+    _cx.ClientXMPP.connect = _patched_connect
+    print("[patch] slixmpp.ClientXMPP.connect patched to accept address=")
+
+# ========================================
+# Normalny kod uruchamiający agentów
+# ========================================
 import os
 import asyncio
 import logging
@@ -9,9 +32,11 @@ from agents.provider_bakery import ProviderAgent
 from agents.reporter import ReporterAgent
 from agents.explorer_ai import ExplorerAgent
 
-
 # --- Logowanie „po staremu” ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.getLogger("slixmpp").setLevel(logging.WARNING)        # ucisza "not-authorized"
+logging.getLogger("aiosasl").setLevel(logging.ERROR)
+logging.getLogger("slixmpp.stringprep").setLevel(logging.ERROR)
 
 
 # --- Pomocnicze funkcje do pobierania JID/PWD z .env ---
@@ -32,17 +57,17 @@ async def main():
     rep = ReporterAgent(jid("reporter"), pwd("reporter"))
     expl = ExplorerAgent(jid("explorer"), pwd("explorer"))
 
-    # --- Konfiguracja XMPP host/port/STARTTLS PRZED start() ---
+    # --- Konfiguracja XMPP host/port/TLS PRZED start() ---
     xmpp_host = os.getenv("XMPP_HOST", "85.215.177.75")
     xmpp_port = int(os.getenv("XMPP_PORT", "5222"))
 
     for a in (coord, prov, rep, expl):
         a.xmpp_host = xmpp_host
         a.xmpp_port = xmpp_port
-        a.use_ssl = True             # ✳️ Nie używamy natychmiastowego SSL
-        a.force_starttls = False       # ✳️ STARTTLS (negocjacja połączenia)
-        a.disable_starttls = True
-        a.verify_security = False     # ✳️ DEV: bez weryfikacji certu
+        a.use_ssl = False              
+        a.force_starttls = True
+        a.disable_starttls = False
+        a.verify_security = True    # DEV: nie sprawdzaj certu
 
     # --- Explorer wie, kto jest koordynatorem ---
     expl.config = {"coordinator": jid("coordinator")}
