@@ -31,6 +31,7 @@ from agents.coordinator import CoordinatorAgent
 from agents.provider_bakery import ProviderAgent
 from agents.reporter import ReporterAgent
 from agents.explorer_ai import ExplorerAgent
+from agents.human import HumanAgent
 
 # --- Logowanie „po staremu” ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -56,6 +57,7 @@ async def main():
     prov = ProviderAgent(jid("provider"), pwd("provider"))
     rep = ReporterAgent(jid("reporter"), pwd("reporter"))
     expl = ExplorerAgent(jid("explorer"), pwd("explorer"))
+    hum = HumanAgent(jid("human"), pwd("human"))
 
     # --- Konfiguracja XMPP host/port/TLS PRZED start() ---
     xmpp_host = os.getenv("XMPP_HOST", "85.215.177.75")
@@ -77,6 +79,7 @@ async def main():
     await prov.start()
     await rep.start()
     await expl.start()
+    await hum.start()
 
     print("✅ Agents up and running. Ctrl+C to stop.")
     # utrzymanie pętli

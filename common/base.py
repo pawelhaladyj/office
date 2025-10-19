@@ -1,22 +1,30 @@
 # common/base.py
-# Fundament dla wszystkich agentów FIPA-ACL.
-# Zapewnia: odbiór → autoryzacja → kontekst (20) → decyzja (rola/AI) → realizacja → wysyłka → audyt.
+# Baza agentów: odbiór AclMessage, wysyłanie AclMessage,
+# wspólny rejestr (auto-odkrywanie w procesie) + obsługa zapytań o rejestr,
+# + CHARAKTER (persona) agenta oraz routing po charakterze (AI/fallback).
+
 import os
+import json
 import time
+import asyncio
 import logging
-from typing import Optional, Deque, Dict, Any, List, Tuple
-from collections import defaultdict, deque
+from typing import Dict, Any, Optional, List, Tuple
 
 from spade.agent import Agent
 from spade.behaviour import CyclicBehaviour
 from spade.template import Template
 
 from common.acl import AclMessage
-from common.llm import plan_reply, realize_acl  # AI: plan -> AclMessage (spójny FIPA)
-from common.fipa import new_conv_id  # używane przy tworzeniu nowych rozmów (gdyby było potrzebne)
+from common.fipa import make_reply
 
+# Opcjonalny wybór przez AI (jeśli istnieje w common.llm)
+try:
+    from common.llm import pick_agent  # def pick_agent(prompt: str, registry: Dict[str, Dict[str, Any]]) -> Optional[str]
+except Exception:
+    pick_agent = None  # fallback na heurystykę
 
-ALLOWED_PERFORMATIVES = {"REQUEST", "AGREE", "REFUSE", "INFORM", "FAILURE", "CANCEL"}
+# Ścieżka do pliku z migawką rejestru (dla podglądu z zewnątrz)
+_REG_PATH = os.getenv("AGENTS_REG_PATH", "out/agents_registry.json")
 
 
 class InboxBehaviour(CyclicBehaviour):
@@ -24,190 +32,224 @@ class InboxBehaviour(CyclicBehaviour):
         msg = await self.receive(timeout=1)
         if not msg:
             return
-
-        sender = str(msg.sender)
-        body = msg.body or ""
-
         try:
-            acl = AclMessage.model_validate_json(body)
+            acl = AclMessage.model_validate_json(msg.body)
         except Exception as e:
-            await self.agent.on_parse_error(raw_body=body, sender_jid=sender, exc=e)
+            print(f"[{self.agent.name}] parse error: {e}")
             return
 
-        try:
-            await self.agent._receive_and_dispatch(acl, sender)
-        except Exception as e:
-            logging.exception("[%s] pipeline error: %s", self.agent.name, e)
+        # Zapamiętaj ostatniego nadawcę dla CID (pomocne m.in. HumanAgent i reply)
+        if acl.conversation_id:
+            self.agent._last_sender_by_cid[acl.conversation_id] = str(msg.sender)
+
+        # Wbudowana obsługa zapytań o rejestr (ontology=office.registry, action=LIST/DISCOVER)
+        if (acl.ontology or "").startswith("office.registry") and acl.performative == "REQUEST":
+            action = str((acl.payload or {}).get("action", "")).upper()
+            if action in ("LIST", "DISCOVER"):
+                snapshot = self.agent.registry_snapshot()
+                out = make_reply(
+                    acl, performative="INFORM",
+                    payload={"agents": snapshot, "ts": int(time.time())},
+                )
+                await self.agent.send_acl(str(msg.sender), out)
+                return
+
+        # Przekaż do logiki konkretnego agenta
+        await self.agent.handle_acl(acl, str(msg.sender))
 
 
 class BaseACLAgent(Agent):
     """
-    Abstrakcyjny agent FIPA-ACL.
-    Klasy pochodne nadpisują: handle_acl(...), build_system_prompt(...), kb_lookup(...), route_model(...), validate_plan(...).
+    Wspólna baza:
+    - automatyczne dopisywanie się do rejestru przy starcie,
+    - szybki dostęp do rejestru (w tym 'character' każdego agenta),
+    - odbiór AclMessage i przekazywanie do handle_acl(),
+    - możliwość odpowiedzi na zapytania o rejestr (FIPA-ACL),
+    - routing po 'character' (AI jeśli dostępne, inaczej heurystyka),
+    - pomocnicze: resolve(alias)->JID, last_sender_for(CID).
     """
 
-    # Domyślna „polityka” (spójna we wszystkich agentach)
-    DEFAULT_PROTOCOL = "fipa-request"
-    DEFAULT_ONTOLOGY = "office.demo"
-    DEFAULT_LANGUAGE = "json"
-
-    CONTEXT_SIZE = int(os.getenv("ACL_CONTEXT_SIZE", "20"))           # ostatnie 20 wypowiedzi per conversation_id
-    REPLY_TIMEOUT_SEC = int(os.getenv("ACL_REPLY_TIMEOUT_SEC", "30")) # domyślny deadline „reply_by”
+    # Rejestr wspólny dla wszystkich instancji w tym samym procesie
+    _REGISTRY: Dict[str, Dict[str, Any]] = {}
+    _REG_LOCK = asyncio.Lock()
 
     def __init__(self, jid: str, password: str):
         super().__init__(jid, password)
-        # stan i konfiguracja wspólna
-        self._context_store: Dict[str, Deque[Dict[str, Any]]] = defaultdict(lambda: deque(maxlen=self.CONTEXT_SIZE))
-        self.reporter_jid: Optional[str] = os.getenv("JID_REPORTER") or None
-        # lista dozwolonych nadawców (opcjonalnie)
-        self.operator_allowlist: set[str] = set(
-            j.strip() for j in os.getenv("OPERATOR_JIDS", "").split(",") if j.strip()
-        )
-        # DEV: zezwól na wszystkich, jeśli lista pusta
-        self.accept_unknown_senders: bool = (os.getenv("ACL_ALLOW_ALL_SENDERS", "true").lower() == "true")
+        self._last_sender_by_cid: Dict[str, str] = {}  # CID -> JID
+        self._character: str = ""  # ustawiane w setup() z ENV lub domyślne
 
-    # ---------- Cykl życia / rejestracja zachowań ----------
+    # --------- API rejestru (dla wszystkich agentów) ---------
+
+    @classmethod
+    def registry_snapshot(cls) -> Dict[str, Dict[str, Any]]:
+        """Płytka kopia rejestru (bezpieczna do logowania/serializacji)."""
+        return {k: dict(v) for k, v in cls._REGISTRY.items()}
+
+    @classmethod
+    async def _register(cls, alias: str, info: Dict[str, Any]) -> None:
+        async with cls._REG_LOCK:
+            cls._REGISTRY[alias] = info
+            # Opcjonalny zrzut na dysk — „po staremu” do wglądu
+            try:
+                os.makedirs(os.path.dirname(_REG_PATH) or ".", exist_ok=True)
+                with open(_REG_PATH, "w", encoding="utf-8") as f:
+                    json.dump(cls._REGISTRY, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                logging.debug(f"[base] write registry file failed: {e}")
+
+    def agents(self) -> Dict[str, Dict[str, Any]]:
+        """Skrót: migawka rejestru z poziomu instancji."""
+        return self.registry_snapshot()
+
+    @staticmethod
+    def _guess_alias(jid_str: str) -> str:
+        """Alias z lokalnej części JID (np. 'coordinator_office' → 'coordinator')."""
+        local = jid_str.split("@", 1)[0]
+        return local.split("_", 1)[0] if "_" in local else local
+
+    def resolve(self, alias_or_jid: str) -> str:
+        """
+        Resolucja aliasu do JID:
+        - jeśli wygląda jak JID (z '@') → zwróć jak jest,
+        - jeśli alias jest w rejestrze → zwróć jego JID,
+        - w ostateczności spróbuj zmiennej środowiskowej JID_<ALIAS>,
+        - jeśli nic nie znajdziemy → zwróć wejście (niech spadnie na błąd wysyłki).
+        """
+        if "@" in alias_or_jid:
+            return alias_or_jid
+        snapshot = self.registry_snapshot()
+        if alias_or_jid in snapshot:
+            return snapshot[alias_or_jid]["jid"]
+        env_jid = os.getenv(f"JID_{alias_or_jid.upper()}")
+        return env_jid or alias_or_jid
+
+    def last_sender_for(self, conversation_id: str) -> Optional[str]:
+        """Zwraca ostatniego nadawcę dla danego CID (jeśli znany)."""
+        return self._last_sender_by_cid.get(conversation_id)
+
+    # --------- Character (persona) ---------
+
+    def character(self) -> str:
+        """Tekstowy charakter agenta (persona)."""
+        return self._character
+
+    def set_character(self, text: str) -> None:
+        """Ustaw charakter w locie i zaktualizuj rejestr."""
+        self._character = (text or "").strip()
+        alias = self._guess_alias(str(self.jid))
+        # bez await: aktualizacja zapisu do pliku może poczekać — ale trzymajmy konsekwencję:
+        async def _upd():
+            info = self.registry_snapshot().get(alias, {})
+            if info:
+                info["character"] = self._character
+                await self._register(alias, info)
+        asyncio.create_task(_upd())
+
+    @staticmethod
+    def _env_character_for(alias: str) -> str:
+        """
+        Poszuka charakteru w ENV:
+        - CHAR_<ALIAS> (np. CHAR_COORDINATOR, CHAR_PROVIDER, ...)
+        - jeśli brak, to AGENT_CHARACTER (globalny fallback)
+        - jeśli brak, domyślny opis tradycyjny.
+        """
+        return (
+            os.getenv(f"CHAR_{alias.upper()}") or
+            os.getenv("AGENT_CHARACTER") or
+            "Tradycyjny, rzeczowy styl; rola ogólna."
+        ).strip()
+
+    # --------- Routing po charakterze ---------
+
+    @staticmethod
+    def _score_text_overlap(prompt: str, persona: str) -> int:
+        """
+        Bardzo prosta heurystyka: liczba wspólnych słów kluczowych (lowercase, alfanum.).
+        Zastępcza, gdy AI niedostępne.
+        """
+        import re
+        tok = lambda s: set(re.findall(r"[a-z0-9]{3,}", s.lower()))
+        a, b = tok(prompt), tok(persona)
+        return len(a & b)
+
+    def choose_agent_by_character(
+        self,
+        prompt: str,
+        *,
+        include_self: bool = False,
+        allowed: Optional[List[str]] = None,
+    ) -> Optional[str]:
+        """
+        Wybierz alias najlepszego adresata po 'character':
+        - jeśli dostępne AI (common.llm.pick_agent) i klucz API → użyj AI,
+        - inaczej heurystyka overlap.
+        Parametr allowed — ogranicz do danej listy aliasów.
+        """
+        registry = self.registry_snapshot()
+        if not registry:
+            return None
+
+        # Zbierz kandydatów
+        candidates: List[Tuple[str, Dict[str, Any]]] = []
+        my_alias = self._guess_alias(str(self.jid))
+        for alias, info in registry.items():
+            if not include_self and alias == my_alias:
+                continue
+            if allowed and alias not in allowed:
+                continue
+            candidates.append((alias, info))
+
+        if not candidates:
+            return None
+
+        # 1) AI, jeśli dostępne
+        if pick_agent is not None:
+            try:
+                choice = pick_agent(prompt, {a: i for a, i in candidates})
+                if choice and any(choice == a for a, _ in candidates):
+                    return choice
+            except Exception as e:
+                logging.debug(f"[base] pick_agent failed, fallback used: {e}")
+
+        # 2) Heurystyka bez-ML
+        scored = []
+        for alias, info in candidates:
+            persona = str(info.get("character", "")) + " " + str(info.get("class", ""))
+            scored.append((self._score_text_overlap(prompt, persona), alias))
+        scored.sort(key=lambda t: (-t[0], t[1]))  # najlepszy wynik, potem alfabetycznie
+        return scored[0][1] if scored else None
+
+    # --------- Cykl życia i komunikacja ---------
+
     async def setup(self):
-        self.add_behaviour(InboxBehaviour(), Template())  # szablon uniwersalny – filtr robimy w handle_acl/validate
-        logging.info("[%s] up", self.name)
+        # 1) Uruchom wspólną skrzynkę odbiorczą AclMessage
+        self.add_behaviour(InboxBehaviour(), Template())
 
-    # ---------- GŁÓWNY PIPELINE (nie nadpisywać w dzieciach) ----------
-    async def _receive_and_dispatch(self, acl: AclMessage, sender_jid: str) -> None:
-        # 1) Autoryzacja
-        if not self.allow_sender(sender_jid):
-            await self.on_unauthorized(sender_jid=sender_jid, acl=acl)
-            return
+        # 2) Auto-rejestracja w rejestrze procesu (+ charakter)
+        alias = self._guess_alias(str(self.jid))
+        # Wczytaj charakter z ENV
+        self._character = self._env_character_for(alias)
 
-        # 2) Kontekst (wejście)
-        self._push_context(direction="in", peer=sender_jid, acl=acl)
-
-        # 3) Decyzja: rola (handle_acl) lub AI (plan_reply)
-        out_acl: Optional[AclMessage] = await self.handle_acl(acl, sender_jid)
-
-        if out_acl is None:
-            # AI plan → realizacja → gotowy AclMessage
-            system_prompt = await self.build_system_prompt()
-            context_lines = self.get_context_lines(acl.conversation_id)
-            kb = await self.kb_lookup(acl, context_lines) or {}
-
-            plan = await plan_reply(
-                acl=acl,
-                role_system_prompt=system_prompt,
-                context_last20=context_lines,
-                kb=kb,
-            )
-
-            ok, why = await self.validate_plan(plan, acl)
-            if not ok:
-                await self.on_bad_plan(plan=plan, incoming_acl=acl, reason=why)
-                return
-
-            out_acl = realize_acl(incoming=acl, plan=plan)
-
-        # 4) Wysyłka – domyślnie odsyłamy do nadawcy (dzieci mogą same wysyłać gdzie indziej w handle_acl)
-        await self.send_acl(to_jid=sender_jid, acl=out_acl)
-
-        # 5) Kontekst (wyjście) + audyt
-        self._push_context(direction="out", peer=sender_jid, acl=out_acl)
-        await self.audit(direction="out", acl=out_acl, peer=sender_jid)
-
-    # ---------- Metody wspólne (nie trzeba nadpisywać) ----------
-    async def send_acl(self, to_jid: str, acl: AclMessage):
-        """Jednolita wysyłka AclMessage jako SPADE Message."""
-        await self.send(acl.to_spade(to_jid, str(self.jid)))
-
-    def _push_context(self, direction: str, peer: str, acl: AclMessage) -> None:
-        """Zapis pojedynczej wypowiedzi do bufora kontekstu (ostatnie 20) dla danego conversation_id."""
-        rec = {
+        info = {
+            "alias": alias,
+            "jid": str(self.jid),
+            "class": self.__class__.__name__,
+            "protocols": ["fipa-request"],
+            "ontologies": ["office.demo", "office.registry"],
+            "character": self._character,
             "ts": int(time.time()),
-            "dir": direction,                      # 'in' lub 'out'
-            "peer": peer,                          # z kim rozmawiamy
-            "performative": acl.performative.upper(),
-            "conversation_id": acl.conversation_id,
-            "ontology": acl.ontology,
-            "language": acl.language,
-            "payload_preview": str(acl.payload)[:160],
         }
-        self._context_store[acl.conversation_id].append(rec)
+        await self._register(alias, info)
 
-    def get_context_lines(self, conversation_id: str) -> List[str]:
-        """Format kontekstu do podania AI (20 ostatnich)."""
-        out: List[str] = []
-        for r in list(self._context_store.get(conversation_id, [])):
-            out.append(
-                f"{r['ts']} | {r['dir']} | {r['peer']} | {r['performative']} | {r['payload_preview']}"
-            )
-        return out
+        print(f"[{self.name}] up (alias={alias})")
 
-    async def audit(self, direction: str, acl: AclMessage, peer: str) -> None:
-        """Opcjonalny audyt – wyślij skrócony INFORM do Reportera."""
-        if not self.reporter_jid:
-            return
-        try:
-            audit_payload = {
-                "direction": direction,
-                "peer": peer,
-                "performative": acl.performative,
-                "conversation_id": acl.conversation_id,
-                "ontology": acl.ontology,
-                "language": acl.language,
-                "payload": acl.payload,
-            }
-            audit_acl = AclMessage(
-                performative="INFORM",
-                conversation_id=acl.conversation_id,
-                ontology=acl.ontology,
-                language=acl.language,
-                payload={"audit": audit_payload},
-            )
-            await self.send_acl(self.reporter_jid, audit_acl)
-        except Exception as e:
-            logging.warning("[%s] audit send failed: %s", self.name, e)
-
-    # ---------- Hooki / kontrakty dla klas dziedziczących ----------
-    async def handle_acl(self, acl: AclMessage, sender: str) -> Optional[AclMessage]:
+    async def handle_acl(self, acl: AclMessage, sender: str):
         """
-        Główna „logika roli”.
-        Zwróć:
-          - AclMessage → jeśli od razu wiesz, co wysłać (np. AGREE/REFUSE/INFORM),
-          - None → jeśli baza ma uruchomić AI (plan_reply → realize_acl).
+        Domyślnie nic nie robi. Nadpisywane w klasach pochodnych.
+        Jeśli potrzebujesz „po staremu” prostego loga – dopisz w klasie dziecka.
         """
-        return None
+        pass
 
-    def allow_sender(self, sender_jid: str) -> bool:
-        """Autoryzacja nadawcy (człowiek-operator itp.)."""
-        if self.accept_unknown_senders:
-            return True
-        if not self.operator_allowlist:
-            return True
-        return sender_jid in self.operator_allowlist
-
-    async def build_system_prompt(self) -> str:
-        """Persona/styl roli do AI. Klasy pochodne mogą zwrócić własny prompt."""
-        return f"You are '{self.name}', a disciplined FIPA-ACL agent. Be brief and precise."
-
-    async def kb_lookup(self, acl: AclMessage, context_lines: List[str]) -> Dict[str, Any]:
-        """Zwróć fragment KB (słownik) dla AI; domyślnie pusto."""
-        return {}
-
-    async def validate_plan(self, plan: Dict[str, Any], incoming_acl: AclMessage) -> Tuple[bool, str]:
-        """
-        Walidacja planu z AI (semantyka FIPA).
-        Wymagane: performative ∈ ALLOWED_PERFORMATIVES; dopuszczalna odpowiedź względem incoming.
-        """
-        perf = str(plan.get("performative", "")).upper()
-        if perf not in ALLOWED_PERFORMATIVES:
-            return False, f"unsupported performative '{perf}'"
-        # Prosta reguła: na REQUEST oczekujemy AGREE/REFUSE, a dopiero potem INFORM/FAILURE (baza tego nie wymusza twardo,
-        # bo nie śledzimy stanu dialogu, ale można dodać surowsze zasady w klasach pochodnych).
-        return True, "ok"
-
-    # ---------- Obsługa błędów / sytuacji wyjątkowych ----------
-    async def on_parse_error(self, raw_body: str, sender_jid: str, exc: Exception) -> None:
-        logging.warning("[%s] parse error from %s: %s", self.name, sender_jid, exc)
-
-    async def on_unauthorized(self, sender_jid: str, acl: AclMessage) -> None:
-        logging.warning("[%s] unauthorized sender %s for conv %s", self.name, sender_jid, acl.conversation_id)
-
-    async def on_bad_plan(self, plan: Dict[str, Any], incoming_acl: AclMessage, reason: str) -> None:
-        logging.warning("[%s] bad AI plan for conv %s: %s | plan=%s", self.name, incoming_acl.conversation_id, reason, plan)
+    async def send_acl(self, to_jid: str, acl: AclMessage):
+        """Wysyłka AclMessage jako SPADE Message (JSON w body, FIPA-metadane w metadata)."""
+        await self.send(acl.to_spade(to_jid, self.jid))

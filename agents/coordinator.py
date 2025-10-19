@@ -1,48 +1,69 @@
+# agents/coordinator.py
 import os
 import asyncio
 import logging
-from spade.agent import Agent
+import random
 from spade.behaviour import OneShotBehaviour, CyclicBehaviour
 from spade.template import Template
 from spade.message import Message
+
+from common.base import BaseACLAgent
 from common.fipa import acl_msg, iso_in, new_conv_id, perf
 
 
-class CoordinatorAgent(Agent):
-    def __init__(self, jid, password):
-        super().__init__(jid, password)
-        self.provider_jid = os.getenv("JID_PROVIDER") or "provider_office@xmpp.pawelhaladyj.pl"
-        self.reporter_jid = os.getenv("JID_REPORTER") or "reporter_office@xmpp.pawelhaladyj.pl"
-
+class CoordinatorAgent(BaseACLAgent):
     async def setup(self):
+        await super().setup()
+        # KickOff zostawiamy, ale adresaci są wybierani dynamicznie z rejestru/character
         self.add_behaviour(self.KickOff())
 
     class KickOff(OneShotBehaviour):
         async def run(self):
-            # Daj innym agentom sekundę na podpięcie behawiorów
-            await asyncio.sleep(1.0)
+            # Daj innym agentom chwilę na rejestrację w Base (rejestr procesowy)
+            # Czekamy aż pojawi się ktoś poza koordynatorem, max ~2s
+            for _ in range(8):
+                if len(self.agent.agents()) > 1:
+                    break
+                await asyncio.sleep(0.25)
+
+            # Wybór PROVIDERA po charakterze (persona); fallback: 'provider'
+            prov_alias = self.agent.choose_agent_by_character(
+                "realizacja zamówień pieczywa, dostawca, produkcja, logistyka"
+            ) or "provider"
+            provider_jid = self.agent.resolve(prov_alias)
+
+            # Wybór REPORTERA po charakterze; fallback: 'reporter'
+            rep_alias = self.agent.choose_agent_by_character(
+                "audyt, rejestrowanie przebiegu konwersacji, logowanie, raportowanie"
+            ) or "reporter"
+            reporter_jid = self.agent.resolve(rep_alias)
 
             # Ustal rozmowę
             conv = new_conv_id("order")
             tpl = Template(metadata={"conversation_id": conv})
 
             # Podłącz behawior ODBIERAJĄCY odpowiedzi ZANIM wyślesz REQUEST
-            waiter = self.agent.WaitReplies(conv, self.agent.reporter_jid)
+            waiter = self.agent.WaitReplies(conv, reporter_jid)
             self.agent.add_behaviour(waiter, tpl)
 
-            # Wyślij REQUEST do Provider
+            # Treść zamówienia: z ENV lub domyślna
+            order_text = os.getenv("ORDER_TEXT", "poproszę 6 bułek")
+            # Niewielki jitter czasu odpowiedzi, ale zawsze w rozsądnym oknie
+            reply_by_iso = iso_in(random.randint(8, 15))
+
+            # Wyślij REQUEST do wybranego Providera (FIPA metadane po staremu)
             req = acl_msg(
-                to=self.agent.provider_jid,
+                to=provider_jid,
                 performative="REQUEST",
-                content="poproszę 6 bułek",
-                reply_by=iso_in(10),
+                content=order_text,
+                reply_by=reply_by_iso,
                 conv_id=conv,
             )
             await self.send(req)
 
-            # AUDYT do Reportera
-            audit = Message(to=self.agent.reporter_jid)
-            audit.body = f"AUDIT: wysłano REQUEST -> {self.agent.provider_jid} ({conv})"
+            # AUDYT do wybranego Reportera
+            audit = Message(to=reporter_jid)
+            audit.body = f"AUDIT: wysłano REQUEST -> {provider_jid} ({conv})"
             md = req.metadata or {}
             audit.set_metadata("protocol", md.get("protocol", "fipa-request"))
             audit.set_metadata("conversation_id", md.get("conversation_id", conv))
