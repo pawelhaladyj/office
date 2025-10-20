@@ -37,24 +37,27 @@ class AclMessage(BaseModel):
         return v
 
     # --- Transport SPADE <-> model ---
-    def to_spade(self, to_jid: str, sender_jid: str) -> Message:
-        """
-        Konwersja do wiadomości SPADE:
-        - body: cały AclMessage jako JSON (model_dump_json)
-        - metadata: spójne klucze z podkreślnikiem
-        """
-        msg = Message(to=to_jid)
+    def to_spade(self, to_jid: str, sender_jid) -> Message:
+        """Zamień AclMessage na SPADE Message z JSON w body i metadanymi FIPA."""
+        msg = Message(to=str(to_jid))
         msg.body = self.model_dump_json()
-        msg.sender = sender_jid
-        msg.metadata = {
+
+        # SPADE tego wymaga – musi być czysty string:
+        msg.sender = str(sender_jid)
+
+        proto = getattr(self, "protocol", None) or "fipa-request"
+        rb = getattr(self, "reply_by", None)
+
+        md = {
             "performative": self.performative,
-            "protocol": self.protocol,
+            "protocol": proto,
             "conversation_id": self.conversation_id,
             "ontology": self.ontology,
             "language": self.language,
         }
-        if self.reply_by:
-            msg.metadata["reply_by"] = self.reply_by
+        if rb:
+            md["reply_by"] = rb
+        msg.metadata = md
         return msg
 
     @classmethod

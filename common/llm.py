@@ -2,206 +2,270 @@
 # Głowa AI: routing modelu, plan odpowiedzi (JSON), realizacja w pełny AclMessage.
 from __future__ import annotations
 
-import os, json, re, asyncio
-from typing import Dict, Any, List, Optional, Tuple
+import os
+import json
+from typing import Any, Dict, Tuple
 
 import httpx
 
-from common.acl import AclMessage
-from common.fipa import make_reply, ensure_reply_by
+from common.acl import AclMessage, ALLOWED_PERFORMATIVES
+from common.fipa import ensure_reply_by, is_valid_transition
+
+# Fallbacki na wypadek braku opcjonalnych modułów:
+try:
+    from common.history import format_for_prompt  # str(agent history JSON)
+except Exception:
+    def format_for_prompt(agent_name: str, conversation_id: str | None) -> str:
+        return "[]"
+
+try:
+    from common.audit import save as audit_save  # audit_save(agent, conv_id, stage, payload_dict)
+except Exception:
+    def audit_save(agent_name: str, conversation_id: str, stage: str, payload: Dict[str, Any]) -> None:
+        pass
 
 
-# ---------------- Routing modelu ----------------
+# --- Ustawienia z .env ---
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.1"))
+LLM_TOP_P = float(os.getenv("LLM_TOP_P", "1"))
+LLM_MAX_OUTPUT_TOKENS = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "700"))
+ACL_REPLY_BY_SECONDS = int(os.getenv("ACL_REPLY_BY_SECONDS", "30"))
 
-def select_model(purpose: str = "reply") -> str:
+# --- JSON Schema, które model MUSI zwrócić ---
+ACL_JSON_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["performative", "conversation_id", "ontology", "language", "protocol", "payload"],
+    "properties": {
+        "performative": {"type": "string", "enum": sorted(list(ALLOWED_PERFORMATIVES))},
+        "conversation_id": {"type": "string", "minLength": 1},
+        "protocol": {"type": "string"},
+        "ontology": {"type": "string"},
+        "language": {"type": "string", "const": "json"},
+        "reply_by": {"type": ["string", "null"]},
+        "sender": {"type": ["string", "null"]},
+        "receiver": {"type": ["string", "null"]},
+        "payload": {
+            "type": "object",
+            "additionalProperties": True,
+            "properties": {
+                "text": {"type": ["string", "null"]},
+                "tags": {"type": ["array"], "items": {"type": "string"}},
+                "ontology_hints": {"type": ["array"], "items": {"type": "string"}},
+            }
+        }
+    }
+}
+
+
+def _system_prompt(agent_name: str, agent_character: str, registry_excerpt: str) -> str:
+    return f"""You are an autonomous XMPP agent speaking FIPA-ACL via JSON.
+STRICT RULES:
+- Output MUST be a single JSON object matching the provided JSON Schema (no extra text).
+- Keep 'conversation_id' and 'protocol' from the incoming message.
+- 'language' MUST be "json".
+- Choose 'performative' according to minimal FIPA transitions:
+  REQUEST -> AGREE or REFUSE; after AGREE -> INFORM or FAILURE.
+- Do not invent sender/receiver: they will be set by the runtime. You may omit them or set null.
+- If ontology is unclear, keep the same, and optionally suggest alternatives in payload.ontology_hints (array of strings).
+- payload.text is the main natural-language answer.
+- Be concise, factual, and actionable. No roleplay fluff.
+
+Agent identity:
+- name: {agent_name}
+- character: {agent_character}
+
+Known peers (alias -> character -> jid):
+{registry_excerpt}
+"""
+
+
+def _build_messages(history_json: str, incoming_acl: AclMessage) -> list[dict]:
+    return [
+        {"role": "user", "content": f"HISTORY (last messages for this agent):\n{history_json}"},
+        {"role": "user", "content": "INCOMING FIPA-ACL JSON:\n" + incoming_acl.model_dump_json(indent=2, ensure_ascii=False)},
+        {"role": "user", "content": "Respond with EXACTLY one JSON object that matches the schema."}
+    ]
+
+
+async def _call_openai(system: str, messages: list[dict]) -> Tuple[str, Dict[str, Any]]:
     """
-    Prosty routing po ENV lub roli celu.
-    ENV ma pierwszeństwo:
-      - LLM_MODEL_REPLY (dla odpowiedzi)
-      - LLM_MODEL_DEFAULT (gdy brak specyficznego)
-    Domyślnie: gpt-4o-mini
+    Woła OpenAI Responses API, zwraca (raw_text, raw_json_dict).
     """
-    if purpose == "reply":
-        return os.getenv("LLM_MODEL_REPLY") or os.getenv("LLM_MODEL_DEFAULT") or "gpt-4o-mini"
-    return os.getenv("LLM_MODEL_DEFAULT") or "gpt-4o-mini"
+    if not OPENAI_API_KEY:
+        # fallback offline — zwróć prosty AGREE z echem
+        dummy = {
+            "performative": "AGREE",
+            "conversation_id": "<fill-me>",
+            "protocol": "fipa-request",
+            "ontology": "office.demo",
+            "language": "json",
+            "reply_by": None,
+            "sender": None,
+            "receiver": None,
+            "payload": {"text": "OK."}
+        }
+        raw = json.dumps(dummy, ensure_ascii=False)
+        return raw, {"output": [{"content": [{"text": raw}]}]}
 
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "model": OPENAI_MODEL,
+        "temperature": LLM_TEMPERATURE,
+        "top_p": LLM_TOP_P,
+        "max_output_tokens": LLM_MAX_OUTPUT_TOKENS,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "acl_message", "schema": ACL_JSON_SCHEMA, "strict": True}
+        },
+        "input": [
+            {"role": "system", "content": system},
+            *messages
+        ],
+    }
+    url = f"{OPENAI_BASE_URL.rstrip('/')}/responses"
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(url, headers=headers, json=body)
+        r.raise_for_status()
+        data = r.json()
 
-# ---------------- Pomocniki ----------------
-
-def _summarize_acl(acl: AclMessage) -> str:
-    preview = ""
+    # Najprostszy sposób na wyciągnięcie tekstu
+    raw_text = ""
     try:
-        preview = json.dumps(acl.payload)[:400]
+        raw_text = data.get("output", [])[0]["content"][0].get("text", "")
     except Exception:
-        preview = str(acl.payload)[:400]
-    return (
-        f"INCOMING:\n"
-        f"- performative: {acl.performative}\n"
-        f"- conversation_id: {acl.conversation_id}\n"
-        f"- protocol: {acl.protocol}\n"
-        f"- ontology: {acl.ontology}\n"
-        f"- language: {acl.language}\n"
-        f"- reply_by: {acl.reply_by or 'null'}\n"
-        f"- payload: {preview}\n"
-    )
+        raw_text = data.get("response", "") or json.dumps(data)
+
+    return raw_text, data
 
 
-def _contract_text() -> str:
-    return (
-        "Zwróć WYŁĄCZNIE jeden obiekt JSON planu odpowiedzi.\n"
-        "Klucze dokładnie:\n"
-        "{\n"
-        '  "performative": "REQUEST|AGREE|REFUSE|INFORM|FAILURE|CANCEL",\n'
-        '  "payload": { ... },\n'
-        '  "text": "krótki opis (<=120 znaków) lub null",\n'
-        '  "reply_by": "ISO8601 UTC (np. 2025-10-19T08:58:46Z) lub null"\n'
-        "}\n"
-        "Zero komentarzy/Markdown. Tylko JSON.\n"
-    )
+async def ai_respond_to_acl(
+    agent,
+    incoming: AclMessage,
+    incoming_sender_jid: str,
+) -> AclMessage:
+    """
+    Zbuduj prompt, zawołaj LLM, zwaliduj i zwróć AclMessage (bez ustawionych sender/receiver).
+    """
+    agent_name = getattr(agent, "name", "agent")
+    agent_character = getattr(agent, "character", "concise, helpful, task-oriented.")
+    registry = []
+    if hasattr(agent, "get_registry_snapshot"):
+        snap = agent.get_registry_snapshot()
+        for alias, meta in snap.items():
+            registry.append({"alias": alias, "character": meta.get("character", ""), "jid": meta.get("jid", "")})
+    registry_excerpt = json.dumps(registry, ensure_ascii=False, indent=2)
 
+    history_json = format_for_prompt(agent_name, None)
 
-_JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
+    # Audyt: wejście
+    audit_save(agent_name, incoming.conversation_id, "incoming", {
+        "incoming_acl": json.loads(incoming.model_dump_json())
+    })
 
-def _extract_json(blob: str) -> Dict[str, Any]:
-    if not blob:
-        raise ValueError("empty model output")
-    m = _JSON_RE.search(blob)
-    if not m:
-        try:
-            return json.loads(blob)
-        except Exception:
-            pass
-        raise ValueError("no JSON object found")
-    return json.loads(m.group(0))
+    system = _system_prompt(agent_name, agent_character, registry_excerpt)
+    messages = _build_messages(history_json, incoming)
 
+    # Audyt: prompt
+    audit_save(agent_name, incoming.conversation_id, "prompt", {
+        "system": system,
+        "messages": messages,
+    })
 
-def _coerce_plan(obj: Dict[str, Any]) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    out["performative"] = str(obj.get("performative", "")).upper()
-    payload = obj.get("payload") or {}
-    out["payload"] = payload if isinstance(payload, dict) else {"value": str(payload)}
-    text = obj.get("text", None)
-    out["text"] = (None if text in (None, "", "null") else str(text)[:120])
-    rby = obj.get("reply_by")
-    out["reply_by"] = (None if rby in (None, "", "null") else str(rby))
-    return out
+    # Call LLM
+    raw_text, raw_json = await _call_openai(system, messages)
 
+    # Audyt: surowa odpowiedź
+    audit_save(agent_name, incoming.conversation_id, "raw_response", {
+        "raw_text": raw_text,
+        "raw_json": raw_json
+    })
 
-def _default_plan_for(acl: AclMessage) -> Dict[str, Any]:
-    if acl.performative == "REQUEST":
-        return {"performative": "AGREE", "payload": {"text": "przyjąłem zlecenie"}, "text": "przyjąłem", "reply_by": None}
-    if acl.performative == "AGREE":
-        return {"performative": "INFORM", "payload": {"result": "wykonano"}, "text": "zrobione", "reply_by": None}
-    return {"performative": "INFORM", "payload": {"echo": acl.payload}, "text": "informacja", "reply_by": None}
-
-
-# ---------------- Główny plan odpowiedzi (AI) ----------------
-
-async def plan_reply(
-    acl: AclMessage,
-    role_system_prompt: str,
-    context_last20: List[str],
-    kb: Dict[str, Any],
-) -> Dict[str, Any]:
-    key = os.getenv("OPENAI_API_KEY", "")
-    if not key:
-        return _default_plan_for(acl)
-
-    model = select_model("reply")
-    temperature = float(os.getenv("LLM_TEMPERATURE", "0.0"))
-    timeout = float(os.getenv("LLM_TIMEOUT", "15"))
-
-    system = (
-        role_system_prompt.strip() + "\n\n"
-        "Zasady:\n"
-        "- mów krótko i rzeczowo, po staremu;\n"
-        "- stosuj FIPA-ACL; tylko dozwolone performatywy;\n"
-        "- 'text' maks. 120 znaków; jeśli zbędny, ustaw null.\n"
-    )
-
-    context_block = "\n".join(context_last20[-20:]) if context_last20 else "(brak kontekstu)"
-    kb_block = json.dumps(kb) if kb else "{}"
-
-    user = (
-        _contract_text()
-        + "\n"
-        + _summarize_acl(acl)
-        + "\nKONTEXT (ostatnie 20):\n"
-        + context_block
-        + "\n\nKB (wycinek):\n"
-        + kb_block
-        + "\n\nPodaj wyłącznie JSON planu odpowiedzi."
-    )
-
+    # Parsowanie JSON
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.post(
-                "https://api.openai.com/v1/responses",
-                headers={"Authorization": f"Bearer {key}"},
-                json={
-                    "model": model,
-                    "input": f"{system}\n\n{user}",
-                    "temperature": temperature,
-                },
+        obj = json.loads(raw_text)
+    except Exception as e:
+        refuse = AclMessage(
+            performative="REFUSE",
+            conversation_id=incoming.conversation_id,
+            protocol=incoming.protocol or "fipa-request",
+            ontology=incoming.ontology,
+            language="json",
+            payload={"text": "Model returned non-JSON response", "error": str(e)},
+        )
+        audit_save(agent_name, incoming.conversation_id, "error", {"reason": "non_json", "detail": str(e)})
+        return refuse
+
+    # Walidacja + dopięcie reply_by
+    try:
+        if not obj.get("reply_by"):
+            obj["reply_by"] = ensure_reply_by(None)  # +30s
+        obj["conversation_id"] = incoming.conversation_id
+        obj["protocol"] = incoming.protocol or "fipa-request"
+        obj["ontology"] = obj.get("ontology") or incoming.ontology
+        obj["language"] = "json"
+        obj["sender"] = None
+        obj["receiver"] = None
+
+        answer = AclMessage.model_validate(obj)
+
+        if not is_valid_transition(incoming.performative, answer.performative):
+            answer = AclMessage(
+                performative="REFUSE",
+                conversation_id=incoming.conversation_id,
+                protocol=incoming.protocol or "fipa-request",
+                ontology=incoming.ontology,
+                language="json",
+                payload={"text": f"Invalid transition {incoming.performative} -> {obj.get('performative')}, refusing."}
             )
-        data = resp.json()
-        raw = data.get("output", [{"content": [{"text": ""}]}])[0]["content"][0].get("text", "")
-        plan_json = _extract_json(raw)
-        plan = _coerce_plan(plan_json)
-        return plan
-    except Exception:
-        return _default_plan_for(acl)
 
+        audit_save(agent_name, incoming.conversation_id, "validated", json.loads(answer.model_dump_json()))
+        return answer
 
-# ---------------- Realizacja planu w pełny AclMessage ----------------
-
-def realize_acl(incoming: AclMessage, plan: Dict[str, Any]) -> AclMessage:
-    perf = str(plan.get("performative", "INFORM")).upper()
-    payload = plan.get("payload") or {}
-    if not isinstance(payload, dict):
-        payload = {"value": str(payload)}
-
-    text = plan.get("text", None)
-    if text and isinstance(text, str):
-        payload.setdefault("text", text[:120])
-
-    rby = plan.get("reply_by", None)
-    if rby is not None:
-        rby = ensure_reply_by(str(rby))
-
-    out = make_reply(
-        incoming,
-        performative=perf,
-        payload=payload,
-        reply_by=rby,
-        strict_transition=False,
-    )
-    return out
-
-
-# ---------------- Shim kompatybilności: suggest(...) ----------------
-
+    except Exception as e:
+        refuse = AclMessage(
+            performative="REFUSE",
+            conversation_id=incoming.conversation_id,
+            protocol=incoming.protocol or "fipa-request",
+            ontology=incoming.ontology,
+            language="json",
+            payload={"text": "Validation error", "error": str(e)},
+        )
+        audit_save(agent_name, incoming.conversation_id, "error", {"reason": "validation", "detail": str(e)})
+        return refuse
+    
+# --- Shim kompatybilności dla starszego kodu (np. agents/explorer_ai.py) ---
 def suggest(text: str, system: str = "You are concise.") -> str:
     """
-    Shim dla starszego kodu (np. explorer_ai.py).
-    Zwraca krótki tekst, bez FIPA – do luźnych sugestii.
-    Blokujący (synchron.), ale prosty i zgodny z wcześniejszym użyciem.
+    Zwraca krótki tekst podpowiedzi. Jeśli brak klucza API, zwraca stałą odpowiedź.
     """
-    key = os.getenv("OPENAI_API_KEY", "")
-    if not key:
+    if not OPENAI_API_KEY:
         return "OK. Budżet zaakceptowany. Proponuję kanapki + woda."
     try:
-        r = httpx.post(
-            "https://api.openai.com/v1/responses",
-            headers={"Authorization": f"Bearer {key}"},
-            json={
-                "model": select_model("reply"),
-                "input": f"{system}\nUser: {text}",
-                "temperature": float(os.getenv("LLM_TEMPERATURE", "0.0")),
-            },
-            timeout=float(os.getenv("LLM_TIMEOUT", "15")),
-        )
+        url = f"{OPENAI_BASE_URL.rstrip('/')}/responses"
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        body = {
+            "model": OPENAI_MODEL,
+            "input": f"{system}\nUser: {text}",
+            "temperature": LLM_TEMPERATURE,
+        }
+        r = httpx.post(url, headers=headers, json=body, timeout=15)
         data = r.json()
-        return data.get("output", [{"content": [{"text": "OK."}]}])[0]["content"][0].get("text", "OK.")
+        # Wyciągnij najprostszy wariant tekstu
+        try:
+            out = data.get("output", [])[0]["content"][0].get("text", "")
+        except Exception:
+            out = data.get("response", "") or "OK."
+        return (out or "OK.").strip()
     except Exception:
         return "OK."
+

@@ -1,7 +1,10 @@
 # common/base.py
 # Baza agentów: odbiór AclMessage, wysyłanie AclMessage,
-# wspólny rejestr (auto-odkrywanie w procesie) + obsługa zapytań o rejestr,
-# + CHARAKTER (persona) agenta oraz routing po charakterze (AI/fallback).
+# rejestr (auto-odkrywanie w procesie), obsługa zapytań o rejestr,
+# CHARACTER (persona) z routowaniem po charakterze, historia IN/OUT,
+# oraz opcjonalny autopilot AI (ENV: AGENT_AUTO_AI).
+
+from __future__ import annotations
 
 import os
 import json
@@ -11,20 +14,36 @@ import logging
 from typing import Dict, Any, Optional, List, Tuple
 
 from spade.agent import Agent
-from spade.behaviour import CyclicBehaviour
+from spade.behaviour import CyclicBehaviour, OneShotBehaviour
 from spade.template import Template
 
 from common.acl import AclMessage
 from common.fipa import make_reply
 
-# Opcjonalny wybór przez AI (jeśli istnieje w common.llm)
+# --- Opcjonalne moduły (nie wymagane do startu) ---
 try:
+    # AI autopilot (plan -> AclMessage) — jeżeli dostępne
+    from common.llm import ai_respond_to_acl  # async def ai_respond_to_acl(agent, incoming: AclMessage, sender_jid: str) -> AclMessage
+except Exception:
+    ai_respond_to_acl = None
+
+try:
+    # Historia (IN/OUT) do promptu i debugowania
+    from common.history import record  # def record(agent_name: str, direction: Literal["IN","OUT"], acl: AclMessage, peer_jid: str) -> None
+except Exception:
+    record = None
+
+try:
+    # Wybór najlepszego adresata po „character”
     from common.llm import pick_agent  # def pick_agent(prompt: str, registry: Dict[str, Dict[str, Any]]) -> Optional[str]
 except Exception:
-    pick_agent = None  # fallback na heurystykę
+    pick_agent = None
 
-# Ścieżka do pliku z migawką rejestru (dla podglądu z zewnątrz)
+# Ścieżka do pliku z migawką rejestru (podgląd z zewnątrz)
 _REG_PATH = os.getenv("AGENTS_REG_PATH", "out/agents_registry.json")
+
+# Czy domyślnie odpowiadać przez AI w BaseACLAgent.handle_acl (możesz wyłączyć per-agent override)
+_AGENT_AUTO_AI_DEFAULT = os.getenv("AGENT_AUTO_AI", "0").strip() in {"1", "true", "TRUE", "yes", "on"}
 
 
 class InboxBehaviour(CyclicBehaviour):
@@ -32,17 +51,27 @@ class InboxBehaviour(CyclicBehaviour):
         msg = await self.receive(timeout=1)
         if not msg:
             return
+
+        # Parsuj tylko, jeśli to wygląda na JSON-ACL
+        md = dict(msg.metadata or {})
+        lang = (md.get("language") or "").lower()
+        body = (msg.body or "").lstrip()
+
+        is_json_like = body.startswith("{") or body.startswith("[")
+        if not (lang == "json" or is_json_like):
+            # Nie-JSON: zostaw innym behawiorom (np. klasycznym FIPA u providera/koordynatora)
+            return
+
         try:
             acl = AclMessage.model_validate_json(msg.body)
         except Exception as e:
             print(f"[{self.agent.name}] parse error: {e}")
             return
 
-        # Zapamiętaj ostatniego nadawcę dla CID (pomocne m.in. HumanAgent i reply)
         if acl.conversation_id:
             self.agent._last_sender_by_cid[acl.conversation_id] = str(msg.sender)
 
-        # Wbudowana obsługa zapytań o rejestr (ontology=office.registry, action=LIST/DISCOVER)
+        # Obsługa zapytań o rejestr
         if (acl.ontology or "").startswith("office.registry") and acl.performative == "REQUEST":
             action = str((acl.payload or {}).get("action", "")).upper()
             if action in ("LIST", "DISCOVER"):
@@ -54,19 +83,20 @@ class InboxBehaviour(CyclicBehaviour):
                 await self.agent.send_acl(str(msg.sender), out)
                 return
 
-        # Przekaż do logiki konkretnego agenta
         await self.agent.handle_acl(acl, str(msg.sender))
 
 
 class BaseACLAgent(Agent):
     """
     Wspólna baza:
-    - automatyczne dopisywanie się do rejestru przy starcie,
-    - szybki dostęp do rejestru (w tym 'character' każdego agenta),
-    - odbiór AclMessage i przekazywanie do handle_acl(),
-    - możliwość odpowiedzi na zapytania o rejestr (FIPA-ACL),
-    - routing po 'character' (AI jeśli dostępne, inaczej heurystyka),
-    - pomocnicze: resolve(alias)->JID, last_sender_for(CID).
+    - auto-rejestracja (alias, klasa, charakter, protokoły/ontologie),
+    - prosty rejestr współdzielony w procesie (+ snapshot do pliku),
+    - odbiór AclMessage i przekazanie do handle_acl(),
+    - obsługa „office.registry” (LIST/DISCOVER),
+    - historia IN/OUT (jeśli obecny common.history),
+    - prosty routing po „character” (AI lub heurystyka),
+    - helpery: resolve(alias)->JID, last_sender_for(CID), alias(), character(), set_character().
+    - opcjonalny autopilot AI: AGENT_AUTO_AI=1 (wtedy domyślne handle_acl odsyła odpowiedź z AI).
     """
 
     # Rejestr wspólny dla wszystkich instancji w tym samym procesie
@@ -77,8 +107,9 @@ class BaseACLAgent(Agent):
         super().__init__(jid, password)
         self._last_sender_by_cid: Dict[str, str] = {}  # CID -> JID
         self._character: str = ""  # ustawiane w setup() z ENV lub domyślne
+        self._auto_ai: bool = _AGENT_AUTO_AI_DEFAULT
 
-    # --------- API rejestru (dla wszystkich agentów) ---------
+    # --------- API rejestru ---------
 
     @classmethod
     def registry_snapshot(cls) -> Dict[str, Dict[str, Any]]:
@@ -89,7 +120,7 @@ class BaseACLAgent(Agent):
     async def _register(cls, alias: str, info: Dict[str, Any]) -> None:
         async with cls._REG_LOCK:
             cls._REGISTRY[alias] = info
-            # Opcjonalny zrzut na dysk — „po staremu” do wglądu
+            # Opcjonalny zrzut na dysk
             try:
                 os.makedirs(os.path.dirname(_REG_PATH) or ".", exist_ok=True)
                 with open(_REG_PATH, "w", encoding="utf-8") as f:
@@ -101,11 +132,16 @@ class BaseACLAgent(Agent):
         """Skrót: migawka rejestru z poziomu instancji."""
         return self.registry_snapshot()
 
+    # --------- Alias/JID/resolve ---------
+
     @staticmethod
     def _guess_alias(jid_str: str) -> str:
         """Alias z lokalnej części JID (np. 'coordinator_office' → 'coordinator')."""
         local = jid_str.split("@", 1)[0]
         return local.split("_", 1)[0] if "_" in local else local
+
+    def alias(self) -> str:
+        return self._guess_alias(str(self.jid))
 
     def resolve(self, alias_or_jid: str) -> str:
         """
@@ -113,7 +149,7 @@ class BaseACLAgent(Agent):
         - jeśli wygląda jak JID (z '@') → zwróć jak jest,
         - jeśli alias jest w rejestrze → zwróć jego JID,
         - w ostateczności spróbuj zmiennej środowiskowej JID_<ALIAS>,
-        - jeśli nic nie znajdziemy → zwróć wejście (niech spadnie na błąd wysyłki).
+        - jeśli nic nie znajdziemy → zwróć wejście (niech błąd poleci przy send()).
         """
         if "@" in alias_or_jid:
             return alias_or_jid
@@ -136,13 +172,14 @@ class BaseACLAgent(Agent):
     def set_character(self, text: str) -> None:
         """Ustaw charakter w locie i zaktualizuj rejestr."""
         self._character = (text or "").strip()
-        alias = self._guess_alias(str(self.jid))
-        # bez await: aktualizacja zapisu do pliku może poczekać — ale trzymajmy konsekwencję:
+        alias = self.alias()
+
         async def _upd():
             info = self.registry_snapshot().get(alias, {})
             if info:
                 info["character"] = self._character
                 await self._register(alias, info)
+
         asyncio.create_task(_upd())
 
     @staticmethod
@@ -163,10 +200,7 @@ class BaseACLAgent(Agent):
 
     @staticmethod
     def _score_text_overlap(prompt: str, persona: str) -> int:
-        """
-        Bardzo prosta heurystyka: liczba wspólnych słów kluczowych (lowercase, alfanum.).
-        Zastępcza, gdy AI niedostępne.
-        """
+        """Prosta heurystyka: liczba wspólnych tokenów alfanum. (lowercase)."""
         import re
         tok = lambda s: set(re.findall(r"[a-z0-9]{3,}", s.lower()))
         a, b = tok(prompt), tok(persona)
@@ -189,9 +223,8 @@ class BaseACLAgent(Agent):
         if not registry:
             return None
 
-        # Zbierz kandydatów
         candidates: List[Tuple[str, Dict[str, Any]]] = []
-        my_alias = self._guess_alias(str(self.jid))
+        my_alias = self.alias()
         for alias, info in registry.items():
             if not include_self and alias == my_alias:
                 continue
@@ -211,23 +244,22 @@ class BaseACLAgent(Agent):
             except Exception as e:
                 logging.debug(f"[base] pick_agent failed, fallback used: {e}")
 
-        # 2) Heurystyka bez-ML
+        # 2) Heurystyka
         scored = []
         for alias, info in candidates:
-            persona = str(info.get("character", "")) + " " + str(info.get("class", ""))
+            persona = f"{info.get('character','')} {info.get('class','')}"
             scored.append((self._score_text_overlap(prompt, persona), alias))
-        scored.sort(key=lambda t: (-t[0], t[1]))  # najlepszy wynik, potem alfabetycznie
+        scored.sort(key=lambda t: (-t[0], t[1]))
         return scored[0][1] if scored else None
 
-    # --------- Cykl życia i komunikacja ---------
+    # --------- Cykl życia ---------
 
     async def setup(self):
         # 1) Uruchom wspólną skrzynkę odbiorczą AclMessage
         self.add_behaviour(InboxBehaviour(), Template())
 
         # 2) Auto-rejestracja w rejestrze procesu (+ charakter)
-        alias = self._guess_alias(str(self.jid))
-        # Wczytaj charakter z ENV
+        alias = self.alias()
         self._character = self._env_character_for(alias)
 
         info = {
@@ -243,13 +275,37 @@ class BaseACLAgent(Agent):
 
         print(f"[{self.name}] up (alias={alias})")
 
-    async def handle_acl(self, acl: AclMessage, sender: str):
+    # --------- Domyślne handle_acl ---------
+
+    async def handle_acl(self, acl: AclMessage, sender_jid: str):
         """
-        Domyślnie nic nie robi. Nadpisywane w klasach pochodnych.
-        Jeśli potrzebujesz „po staremu” prostego loga – dopisz w klasie dziecka.
+        Domyślnie: jeżeli włączony autopilot i dostępny common.llm.ai_respond_to_acl,
+        to wygeneruj odpowiedź przez AI i odeślij do nadawcy.
+        W przeciwnym razie — no-op (nadpisz w klasie pochodnej).
         """
-        pass
+        if self._auto_ai and ai_respond_to_acl is not None:
+            try:
+                reply_acl = await ai_respond_to_acl(self, acl, sender_jid)
+                await self.send_acl(sender_jid, reply_acl)
+                return
+            except Exception as e:
+                logging.warning(f"[{self.name}] AI autopilot failed: {e}")
+        # brak autopilota — nadpisz w dziecku
+        return
+
+    # --------- Wysyłka ---------
 
     async def send_acl(self, to_jid: str, acl: AclMessage):
-        """Wysyłka AclMessage jako SPADE Message (JSON w body, FIPA-metadane w metadata)."""
-        await self.send(acl.to_spade(to_jid, self.jid))
+        """Wysyłka AclMessage jako SPADE Message (JSON w body, FIPA-meta w metadata)
+        przez OneShotBehaviour (używa Behaviour.send, które jest stabilne)."""
+        spade_msg = acl.to_spade(to_jid, self.jid)
+
+        class _SendOnce(OneShotBehaviour):
+            def __init__(self, m):
+                super().__init__()
+                self._m = m
+            async def run(self):
+                await self.send(self._m)
+
+        self.add_behaviour(_SendOnce(spade_msg))
+
