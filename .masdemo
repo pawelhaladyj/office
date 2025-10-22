@@ -33,6 +33,11 @@ from agents.reporter import ReporterAgent
 from agents.explorer_ai import ExplorerAgent
 from agents.human import HumanAgent
 
+try:
+    load_dotenv()  # wczyta klucze z .env do os.environ
+except Exception:
+    pass
+
 # --- Logowanie „po staremu” ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logging.getLogger("slixmpp").setLevel(logging.WARNING)        # ucisza "not-authorized"

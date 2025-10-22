@@ -63,7 +63,7 @@ class ExplorerAgent(BaseACLAgent):
             await self.agent.send_acl(to_jid, msg)
             logging.info("[explorer] REQUEST (%s) -> %s: %s", cid, to_jid, user_text)
 
-    async def handle_acl(self, acl, sender: str):
-        # Explorer w tym wariancie tylko inicjuje; logujemy ewentualne odpowiedzi
-        logging.info("[explorer] recv perf=%s cid=%s from=%s", acl.performative, acl.conversation_id, sender)
-        # Tu można dodać dalsze sterowanie (np. decyzje doradcze) w kolejnych iteracjach projektu.
+    async def handle_acl(self, acl, sender_jid):
+        logging.info("[explorer] recv perf=%s cid=%s from=%s", acl.performative, acl.conversation_id, sender_jid)
+        # to uruchamia autopilota AI z BaseACLAgent (AGREE/INFORM/…)
+        await super().handle_acl(acl, sender_jid)

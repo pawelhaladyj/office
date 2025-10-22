@@ -42,9 +42,6 @@ except Exception:
 # Ścieżka do pliku z migawką rejestru (podgląd z zewnątrz)
 _REG_PATH = os.getenv("AGENTS_REG_PATH", "out/agents_registry.json")
 
-# Czy domyślnie odpowiadać przez AI w BaseACLAgent.handle_acl (możesz wyłączyć per-agent override)
-_AGENT_AUTO_AI_DEFAULT = os.getenv("AGENT_AUTO_AI", "0").strip() in {"1", "true", "TRUE", "yes", "on"}
-
 
 class InboxBehaviour(CyclicBehaviour):
     async def run(self):
@@ -63,10 +60,16 @@ class InboxBehaviour(CyclicBehaviour):
             return
 
         try:
-            acl = AclMessage.model_validate_json(msg.body)
+            acl = AclMessage.from_spade(msg)
         except Exception as e:
             print(f"[{self.agent.name}] parse error: {e}")
             return
+        
+        try:
+            from common.history import record as _rec
+            _rec(self.agent.name, "IN", acl, str(msg.sender))
+        except Exception:
+            pass
 
         if acl.conversation_id:
             self.agent._last_sender_by_cid[acl.conversation_id] = str(msg.sender)
@@ -107,9 +110,25 @@ class BaseACLAgent(Agent):
         super().__init__(jid, password)
         self._last_sender_by_cid: Dict[str, str] = {}  # CID -> JID
         self._character: str = ""  # ustawiane w setup() z ENV lub domyślne
-        self._auto_ai: bool = _AGENT_AUTO_AI_DEFAULT
+        self._role: str = ""            # rola agenta: 'coordinator' | 'provider_simple' | ''
+        self._pending: Dict[str, str] = {} 
+        def _auto_ai_from_env() -> bool:
+            return (os.getenv("AGENT_AUTO_AI", "0").strip().lower() in {"1", "true", "yes", "on"})
+
+        # ... w BaseACLAgent.__init__ zamień:
+        # self._auto_ai: bool = _AGENT_AUTO_AI_DEFAULT
+        self._auto_ai: bool = _auto_ai_from_env()
 
     # --------- API rejestru ---------
+    
+    @staticmethod
+    def _env_role_for(alias: str) -> str:
+        # najpierw ROLE_<ALIAS>, potem AGENT_ROLE
+        return (
+            os.getenv(f"ROLE_{alias.upper()}") or
+            os.getenv("AGENT_ROLE") or
+            ""
+        ).strip().lower()
 
     @classmethod
     def registry_snapshot(cls) -> Dict[str, Dict[str, Any]]:
@@ -261,6 +280,7 @@ class BaseACLAgent(Agent):
         # 2) Auto-rejestracja w rejestrze procesu (+ charakter)
         alias = self.alias()
         self._character = self._env_character_for(alias)
+        self._role = self._env_role_for(alias)
 
         info = {
             "alias": alias,
@@ -269,6 +289,7 @@ class BaseACLAgent(Agent):
             "protocols": ["fipa-request"],
             "ontologies": ["office.demo", "office.registry"],
             "character": self._character,
+            "role": self._role or "generic",    # <— DODAJ
             "ts": int(time.time()),
         }
         await self._register(alias, info)
@@ -278,19 +299,82 @@ class BaseACLAgent(Agent):
     # --------- Domyślne handle_acl ---------
 
     async def handle_acl(self, acl: AclMessage, sender_jid: str):
-        """
-        Domyślnie: jeżeli włączony autopilot i dostępny common.llm.ai_respond_to_acl,
-        to wygeneruj odpowiedź przez AI i odeślij do nadawcy.
-        W przeciwnym razie — no-op (nadpisz w klasie pochodnej).
-        """
+        perf = (acl.performative or "").upper()
+        cid = acl.conversation_id
+
+        # --- tryb KOORDYNATORA: przyjmuje REQUEST od człowieka/AI, forwarduje do właściwego agenta,
+        #     a wyniki (INFORM/FAILURE/REFUSE) odsyła inicjatorowi ---
+        if self._role == "coordinator":
+            if perf == "REQUEST":
+                # zapamiętaj komu oddać wynik
+                if cid:
+                    self._pending[cid] = sender_jid
+
+                # szybkie AGREE do inicjatora
+                from common.fipa import make_reply
+                agree = make_reply(acl, performative="AGREE", payload={"text": "przyjęto do realizacji"})
+                await self.send_acl(sender_jid, agree)
+
+                # wybór adresata po charakterze
+                user_text = ""
+                if isinstance(acl.payload, dict):
+                    user_text = str(acl.payload.get("text") or acl.payload.get("user_text") or "")
+
+                target_alias = self.choose_agent_by_character(user_text or "zamówienie pieczywa") or "provider"
+                target_jid = self.resolve(target_alias)
+
+                down_req = make_reply(acl, performative="REQUEST", payload=acl.payload or {"text": user_text})
+                await self.send_acl(target_jid, down_req)
+                logging.info("[%s] REQUEST → %s (%s)", self.alias(), target_alias, cid)
+                return
+
+            if perf in ("INFORM", "FAILURE", "REFUSE"):
+                reply_to = self._pending.get(cid) or sender_jid
+                from common.fipa import make_reply
+                fwd = make_reply(acl, performative=perf, payload=acl.payload)
+                await self.send_acl(reply_to, fwd)
+                logging.info("[%s] %s (%s) → przekazano do inicjatora", self.alias(), perf, cid)
+                if perf in ("INFORM", "FAILURE", "REFUSE"):
+                    self._pending.pop(cid, None)
+                return
+
+            # AGREE od providera można zignorować albo forwardować — tu ignorujemy “szum”
+            return
+
+        # --- tryb PROSTY PROVIDER: na REQUEST → AGREE + po chwili INFORM ---
+        if self._role == "provider_simple":
+            if perf != "REQUEST":
+                return
+            from common.fipa import make_reply
+            agree = make_reply(acl, performative="AGREE", payload={"text": "ok, realizuję"})
+            await self.send_acl(sender_jid, agree)
+
+            await asyncio.sleep(0.5)
+            txt = "zamówienie zrealizowane"
+            if isinstance(acl.payload, dict) and acl.payload.get("text"):
+                txt = f"zrealizowano: {acl.payload['text']}"
+
+            inform = make_reply(acl, performative="INFORM", payload={"text": txt})
+            await self.send_acl(sender_jid, inform)
+            return
+
+        # --- fallback: autopilot AI, jeśli włączony i dostępny ---
         if self._auto_ai and ai_respond_to_acl is not None:
             try:
+                # IN do historii (jeśli jest)
+                try:
+                    from common.history import record as _rec
+                    _rec(self.name, "IN", acl, sender_jid)
+                except Exception:
+                    pass
+
                 reply_acl = await ai_respond_to_acl(self, acl, sender_jid)
                 await self.send_acl(sender_jid, reply_acl)
                 return
             except Exception as e:
                 logging.warning(f"[{self.name}] AI autopilot failed: {e}")
-        # brak autopilota — nadpisz w dziecku
+
+        # w pozostałych trybach brak domyślnej akcji
         return
 
     # --------- Wysyłka ---------
@@ -298,7 +382,7 @@ class BaseACLAgent(Agent):
     async def send_acl(self, to_jid: str, acl: AclMessage):
         """Wysyłka AclMessage jako SPADE Message (JSON w body, FIPA-meta w metadata)
         przez OneShotBehaviour (używa Behaviour.send, które jest stabilne)."""
-        spade_msg = acl.to_spade(to_jid, self.jid)
+        spade_msg = acl.to_spade(to_jid, str(self.jid))
 
         class _SendOnce(OneShotBehaviour):
             def __init__(self, m):
@@ -306,6 +390,12 @@ class BaseACLAgent(Agent):
                 self._m = m
             async def run(self):
                 await self.send(self._m)
+                
+        try:
+            from common.history import record as _rec
+            _rec(self.name, "OUT", acl, to_jid)
+        except Exception:
+            pass        
 
         self.add_behaviour(_SendOnce(spade_msg))
 
