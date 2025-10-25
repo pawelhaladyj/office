@@ -29,7 +29,6 @@ except Exception:
 
 
 # --- Ustawienia z .env ---
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.1"))
@@ -63,6 +62,8 @@ ACL_JSON_SCHEMA: Dict[str, Any] = {
     }
 }
 
+def _get_openai_key() -> str:
+    return (os.getenv("OPENAI_API_KEY") or "").strip()
 
 def _system_prompt(agent_name: str, agent_character: str, registry_excerpt: str) -> str:
     return f"""You are an autonomous XMPP agent speaking FIPA-ACL via JSON.
@@ -100,8 +101,17 @@ async def _call_openai(agent_name: str, conversation_id: str, system: str, messa
     Zwraca (raw_text, raw_json). raw_text = zserializowany JSON odpowiedzi.
     """
     url = f"{OPENAI_BASE_URL.rstrip('/')}/responses"
+    
+    key = _get_openai_key()
+    if not key:
+        logger.warning("OPENAI_API_KEY brak/pusty – pomijam wywołanie OpenAI.")
+        # zwróć „syntetyczną” odpowiedź, by warstwa wyżej mogła stworzyć REFUSE
+        data = {"error": "missing_api_key"}
+        raw_text = json.dumps(data, ensure_ascii=False)
+        return raw_text, data
+    
     headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
     }
     body = {
@@ -170,6 +180,17 @@ async def ai_respond_to_acl(
 
     # Call LLM
     raw_text, raw_json = await _call_openai(agent_name, incoming.conversation_id, system, messages)
+    
+    # brak klucza → _call_openai zwróci {"error":"missing_api_key"}
+    if isinstance(raw_json, dict) and raw_json.get("error") == "missing_api_key":
+        return AclMessage(
+            performative="REFUSE",
+            conversation_id=incoming.conversation_id,
+            protocol=incoming.protocol or "fipa-request",
+            ontology=incoming.ontology,
+            language="json",
+            payload={"text": "AI autopilot wyłączony: brak OPENAI_API_KEY"}
+        )
 
     # Audyt: surowa odpowiedź
     audit_save(agent_name, incoming.conversation_id, "raw_response", {
@@ -236,13 +257,13 @@ def suggest(text: str, system: str = "You are concise.") -> str:
     Prosty prompt pomocniczy. Zwraca tekst.
     Loguje pełne body żądania i pełną odpowiedź.
     """
-    if not OPENAI_API_KEY:
-        # fallback – brak klucza: zwróć wejście lub skrót zgodnie z Twoją dotychczasową logiką
-        return text
+    key = _get_openai_key()
+    if not key:
+        return text  # bezpieczny fallback
 
     url = f"{OPENAI_BASE_URL.rstrip('/')}/responses"
     headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
     }
     body = {

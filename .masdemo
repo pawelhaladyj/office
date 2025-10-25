@@ -25,18 +25,18 @@ if "address" not in inspect.signature(_cx.ClientXMPP.connect).parameters:
 import os
 import asyncio
 import logging
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
+
+try:
+    load_dotenv(find_dotenv(usecwd=True), override=True) # wczyta klucze z .env do os.environ
+except Exception:
+    pass
 
 from agents.coordinator import CoordinatorAgent
 from agents.provider_bakery import ProviderAgent
 from agents.reporter import ReporterAgent
 from agents.explorer_ai import ExplorerAgent
 from agents.human import HumanAgent
-
-try:
-    load_dotenv()  # wczyta klucze z .env do os.environ
-except Exception:
-    pass
 
 # --- Logowanie „po staremu” ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")

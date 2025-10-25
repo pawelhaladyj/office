@@ -89,57 +89,57 @@ class AclMessage(BaseModel):
     def from_spade(cls, msg: Message) -> "AclMessage":
         """
         Odtwarza AclMessage z wiadomości SPADE.
-        Priorytet:
-        1) body jako JSON (uzupełniamy brakujące pola metadanymi i nadawcą/odbiorcą),
-        2) metadane + body jako tekst w payload["text"].
-        Akceptuje conversation_id lub (legacy) conversation-id.
+        1) Próbuje zdekodować body jako JSON i dopełnia metadanymi.
+        2) Fallback: metadane + surowe body w payload["text"].
+        Zawsze zwraca obiekt albo rzuca wyjątek — nigdy po cichu None.
         """
-        md = msg.metadata or {}
+        md   = msg.metadata or {}
         conv = md.get("conversation_id") or md.get("conversation-id")
         perf = (md.get("performative") or "").upper()
-        proto = md.get("protocol") or "fipa-request"
+        proto= md.get("protocol") or "fipa-request"
         onto = md.get("ontology") or "office.demo"
         lang = md.get("language") or "json"
-        rby = md.get("reply_by")
-        snd = str(msg.sender) if msg.sender else None
-        rcv = str(msg.to) if msg.to else None
+        rby  = md.get("reply_by")
+        snd  = str(msg.sender) if msg.sender else None
+        rcv  = str(getattr(msg, "to", None)) if getattr(msg, "to", None) else None
 
-        # 1) Spróbuj body jako JSON i dopełnij brakujące pola
+        # 1) BODY JAKO JSON
         if msg.body:
             try:
                 obj = json.loads(msg.body)
                 if not isinstance(obj, dict):
                     raise ValueError("body JSON is not an object")
 
-                # Dopełnij wymagane pola jeśli nie ma ich w body
-                obj.setdefault("performative", perf)
+                # dopełnienia
+                obj.setdefault("performative",  perf)
                 obj.setdefault("conversation_id", conv)
-                obj.setdefault("protocol", proto)
-                obj.setdefault("ontology", onto)
-                obj.setdefault("language", lang)
-                obj.setdefault("reply_by", rby)
-                obj.setdefault("sender", snd)
-                obj.setdefault("receiver", rcv)
+                obj.setdefault("protocol",      proto)
+                obj.setdefault("ontology",      onto)
+                obj.setdefault("language",      lang)
+                obj.setdefault("reply_by",      rby)
+                obj.setdefault("sender",        snd)
+                obj.setdefault("receiver",      rcv)
                 if "payload" not in obj or not isinstance(obj["payload"], dict):
-                    obj["payload"] = {"text": msg.body}
+                    obj["payload"] = {}
 
-                    out = cls.model_validate(obj)
+                out = cls.model_validate(obj)  # ← WAŻNE: poza if-em dot. payload
+
                 try:
-                    log_acl("SPADE_IN", out, agent=None, peer=str(msg.sender), transport="spade", note="from_spade/body_json")
+                    log_acl("SPADE_IN", out, agent=None, peer=str(msg.sender),
+                            transport="spade", note="from_spade/body_json")
                 except Exception:
                     pass
                 return out
-            except Exception:
-                # lecimy do trybu 2)
-                pass
+            except Exception as e:
+                logger.error("from_spade: invalid/unsupported JSON body: %s", e)
 
-        # 2) Fallback: metadane + surowe body jako payload.text
+        # 2) FALLBACK: metadane + surowe body jako tekst
         payload: Dict[str, Any] = {}
         if msg.body:
             payload["text"] = msg.body
 
         out = cls(
-            performative=perf,
+            performative=perf,            # brak/nieprawidłowy → walidator rzuci błąd (i dobrze)
             conversation_id=conv,
             protocol=proto,
             ontology=onto,
@@ -149,3 +149,9 @@ class AclMessage(BaseModel):
             receiver=rcv,
             payload=payload,
         )
+        try:
+            log_acl("SPADE_IN", out, agent=None, peer=str(msg.sender),
+                    transport="spade", note="from_spade/fallback")
+        except Exception:
+            pass
+        return out
