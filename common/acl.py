@@ -1,3 +1,10 @@
+import logging
+import json
+try:
+    from common.audit import log_acl
+except Exception:
+    def log_acl(*args, **kwargs):
+        pass
 # common/acl.py
 from typing import Dict, Any, Optional
 import json
@@ -5,7 +12,10 @@ import json
 from pydantic import BaseModel, Field, field_validator
 from spade.message import Message
 
-ALLOWED_PERFORMATIVES = {"REQUEST", "AGREE", "REFUSE", "INFORM", "FAILURE", "CANCEL"}
+logger = logging.getLogger("common.acl")
+PERFORMATIVES = {"REQUEST", "AGREE", "REFUSE", "INFORM", "FAILURE", "CANCEL"}
+
+ALLOWED_PERFORMATIVES = PERFORMATIVES 
 
 class AclMessage(BaseModel):
     """
@@ -23,13 +33,14 @@ class AclMessage(BaseModel):
     sender: Optional[str] = None          # <— DODANE
     receiver: Optional[str] = None        # <— DODANE
     payload: Dict[str, Any] = Field(default_factory=dict)
-
+    
     # --- Normalizacja / walidacja pól ---
     @field_validator("performative")
     @classmethod
     def _perf_upper_and_allowed(cls, v: str) -> str:
-        v_up = (v or "").upper()
+        v_up = (v or "").upper().strip()
         if v_up not in ALLOWED_PERFORMATIVES:
+            logger.error("unsupported performative %r", v)
             raise ValueError(f"unsupported performative '{v}'")
         return v_up
 
@@ -68,6 +79,10 @@ class AclMessage(BaseModel):
         if rb:
             md["reply_by"] = rb
         msg.metadata = md
+        try:
+            logger.info(json.dumps({"kind":"ACL_TO_SPADE","acl": body, "metadata": md}, ensure_ascii=False))
+        except Exception:
+            pass
         return msg
 
     @classmethod
@@ -108,7 +123,12 @@ class AclMessage(BaseModel):
                 if "payload" not in obj or not isinstance(obj["payload"], dict):
                     obj["payload"] = {"text": msg.body}
 
-                return cls.model_validate(obj)
+                    out = cls.model_validate(obj)
+                try:
+                    log_acl("SPADE_IN", out, agent=None, peer=str(msg.sender), transport="spade", note="from_spade/body_json")
+                except Exception:
+                    pass
+                return out
             except Exception:
                 # lecimy do trybu 2)
                 pass
@@ -118,7 +138,7 @@ class AclMessage(BaseModel):
         if msg.body:
             payload["text"] = msg.body
 
-        return cls(
+        out = cls(
             performative=perf,
             conversation_id=conv,
             protocol=proto,

@@ -1,6 +1,10 @@
 # common/history.py
 from __future__ import annotations
 
+import logging
+
+import logging
+
 from collections import defaultdict, deque
 from typing import Deque, Dict, Literal, List, Tuple, Optional
 from common.acl import AclMessage
@@ -10,6 +14,7 @@ Direction = Literal["IN", "OUT"]
 # Pamięć procesowa: agent_name -> deque[(Direction, AclMessage, peer_jid)]
 def _default_limit() -> int:
     import os
+logger = logging.getLogger("common.history")
     try:
         return max(1, int(os.getenv("ACL_HISTORY_LIMIT", "20")))
     except Exception:
@@ -30,7 +35,17 @@ __all__ = [
 
 
 def record(agent_name: str, direction: Direction, acl: AclMessage, peer_jid: str) -> None:
-    """Dodaj wpis historii dla danego agenta."""
+    \"\"\"Dodaj wpis historii dla danego agenta.\"\"\"
+    try:
+        logger.info(json.dumps({
+            "kind": "ACL_HISTORY",
+            "agent": agent_name,
+            "direction": direction,
+            "peer": peer_jid,
+            "acl": json.loads(acl.model_dump_json())
+        }, ensure_ascii=False))
+    except Exception:
+        pass
     _STORE[agent_name].append((direction, acl, peer_jid))
 
 

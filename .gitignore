@@ -49,3 +49,4 @@ docs/_build/
 
 # __ Zapis Rozmowy ______________________________________________
 out/
+logs.txt

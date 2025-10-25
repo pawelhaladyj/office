@@ -11,7 +11,17 @@ import json
 import time
 import asyncio
 import logging
+try:
+    from common.audit import log_acl
+except Exception:
+    def log_acl(*args, **kwargs):
+        pass
 from typing import Dict, Any, Optional, List, Tuple
+
+LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO').upper()
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format='%(asctime)s %(levelname)s %(name)s: %(message)s')
+logger = logging.getLogger('common.base')
 
 from spade.agent import Agent
 from spade.behaviour import CyclicBehaviour, OneShotBehaviour
@@ -65,9 +75,22 @@ class InboxBehaviour(CyclicBehaviour):
             print(f"[{self.agent.name}] parse error: {e}")
             return
         
+        if 'log_acl' in globals() and callable(log_acl):
+            log_acl("IN", acl, agent=self.agent.name, peer=str(msg.sender), transport="spade")
+        
         try:
             from common.history import record as _rec
             _rec(self.agent.name, "IN", acl, str(msg.sender))
+
+            # zamiast wewnętrznego try — prosty if z asekuracją na loggera
+            if 'logger' in globals() and hasattr(logger, 'info'):
+                payload = {
+                    "kind": "ACL_IN",
+                    "agent": self.agent.name,
+                    "from": str(msg.sender),
+                    "acl": json.loads(acl.model_dump_json()),
+                }
+                logger.info(json.dumps(payload, ensure_ascii=False))
         except Exception:
             pass
 
@@ -394,6 +417,14 @@ class BaseACLAgent(Agent):
         try:
             from common.history import record as _rec
             _rec(self.name, "OUT", acl, to_jid)
+            try:
+                log_acl("OUT", acl, agent=self.name, peer=to_jid, transport="spade")
+            except Exception:
+                pass
+            try:
+                logger.info(json.dumps({"kind":"ACL_OUT","agent": self.name, "to": to_jid, "acl": json.loads(acl.model_dump_json())}, ensure_ascii=False))
+            except Exception:
+                pass
         except Exception:
             pass        
 

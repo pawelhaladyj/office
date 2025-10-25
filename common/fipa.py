@@ -5,9 +5,13 @@
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any
 from uuid import uuid4
+import logging
+import json
 
 from spade.message import Message
 from common.acl import AclMessage, ALLOWED_PERFORMATIVES
+
+logger = logging.getLogger("common.fipa")
 
 
 # ---------- Czas i identyfikatory ----------
@@ -82,7 +86,7 @@ def build_message(
     if text is not None:
         data.setdefault("text", text)
     rb = ensure_reply_by(reply_by) if reply_by is not None else None
-    return AclMessage(
+    reply_obj = AclMessage(
         performative=performative.upper(),
         conversation_id=conversation_id,
         protocol=protocol,
@@ -91,6 +95,11 @@ def build_message(
         reply_by=rb,
         payload=data,
     )
+    try:
+        logger.info(json.dumps({"kind": "ACL_MAKE_REPLY", "from_performative": incoming.performative, "to_performative": perf_up, "conversation_id": incoming.conversation_id, "reply": json.loads(reply_obj.model_dump_json())}, ensure_ascii=False))
+    except Exception:
+        pass
+    return reply_obj
 
 def make_reply(
     incoming: AclMessage,
@@ -113,7 +122,7 @@ def make_reply(
     if text is not None:
         data.setdefault("text", text)
     rb = ensure_reply_by(reply_by) if reply_by is not None else None
-    return AclMessage(
+    reply_obj = AclMessage(
         performative=perf_up,
         conversation_id=incoming.conversation_id,
         protocol=protocol or incoming.protocol or "fipa-request",
@@ -122,6 +131,11 @@ def make_reply(
         reply_by=rb,
         payload=data,
     )
+    try:
+        logger.info(json.dumps({"kind": "ACL_MAKE_REPLY", "from_performative": incoming.performative, "to_performative": perf_up, "conversation_id": incoming.conversation_id, "reply": json.loads(reply_obj.model_dump_json())}, ensure_ascii=False))
+    except Exception:
+        pass
+    return reply_obj
 
 
 # ---------- Funkcje kompatybilności „po staremu” ----------

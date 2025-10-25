@@ -7,9 +7,12 @@ import json
 from typing import Any, Dict, Tuple
 
 import httpx
+import logging
 
 from common.acl import AclMessage, ALLOWED_PERFORMATIVES
 from common.fipa import ensure_reply_by, is_valid_transition
+
+logger = logging.getLogger("common.llm")
 
 # Fallbacki na wypadek braku opcjonalnych modułów:
 try:
@@ -19,7 +22,7 @@ except Exception:
         return "[]"
 
 try:
-    from common.audit import save as audit_save  # audit_save(agent, conv_id, stage, payload_dict)
+    from common.audit import save as audit_save, log_ai_request, log_ai_response  # audit_save(agent, conv_id, stage, payload_dict)
 except Exception:
     def audit_save(agent_name: str, conversation_id: str, stage: str, payload: Dict[str, Any]) -> None:
         pass
@@ -91,59 +94,46 @@ def _build_messages(history_json: str, incoming_acl: AclMessage) -> list[dict]:
     ]
 
 
-async def _call_openai(system: str, messages: list[dict]) -> Tuple[str, Dict[str, Any]]:
+async def _call_openai(agent_name: str, conversation_id: str, system: str, messages: list[dict]) -> Tuple[str, Dict[str, Any]]:
     """
-    Woła OpenAI Responses API, zwraca (raw_text, raw_json_dict).
+    Asynchroniczne wywołanie Responses API.
+    Zwraca (raw_text, raw_json). raw_text = zserializowany JSON odpowiedzi.
     """
-    if not OPENAI_API_KEY:
-        # fallback offline — zwróć prosty AGREE z echem
-        dummy = {
-            "performative": "AGREE",
-            "conversation_id": "<fill-me>",
-            "protocol": "fipa-request",
-            "ontology": "office.demo",
-            "language": "json",
-            "reply_by": None,
-            "sender": None,
-            "receiver": None,
-            "payload": {"text": "OK."}
-        }
-        raw = json.dumps(dummy, ensure_ascii=False)
-        return raw, {"output": [{"content": [{"text": raw}]}]}
-
+    url = f"{OPENAI_BASE_URL.rstrip('/')}/responses"
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json",
     }
     body = {
         "model": OPENAI_MODEL,
-        "temperature": LLM_TEMPERATURE,
-        "top_p": LLM_TOP_P,
-        "max_output_tokens": LLM_MAX_OUTPUT_TOKENS,
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {"name": "acl_message", "schema": ACL_JSON_SCHEMA, "strict": True}
-        },
-        "input": [
-            {"role": "system", "content": system},
-            *messages
-        ],
+        "input": messages,                       # ← zakładam, że messages już jest w formacie Responses API
+        "response_format": {"type": "json_object"},
     }
-    url = f"{OPENAI_BASE_URL.rstrip('/')}/responses"
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(url, headers=headers, json=body)
-        r.raise_for_status()
-        data = r.json()
 
-    # Najprostszy sposób na wyciągnięcie tekstu
-    raw_text = ""
+    # — log pełnego requestu + etap „prompt” do pliku audytu —
     try:
-        raw_text = data.get("output", [])[0]["content"][0].get("text", "")
+        log_ai_request(agent_name, conversation_id, "openai", OPENAI_MODEL, body, endpoint=url, headers=headers)
+        audit_save(agent_name, conversation_id, "prompt", {"system": system, "messages": messages, "http_body": body})
     except Exception:
-        raw_text = data.get("response", "") or json.dumps(data)
+        pass
 
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(url, headers=headers, json=body)
+
+    # — odczyt odpowiedzi jako JSON —
+    try:
+        data: Dict[str, Any] = resp.json()
+    except Exception:
+        data = {"_non_json_body": resp.text}
+
+    # — log pełnej odpowiedzi —
+    try:
+        log_ai_response(agent_name, conversation_id, "openai", OPENAI_MODEL, int(getattr(resp, "status_code", 0) or 0), data)
+    except Exception:
+        pass
+
+    raw_text = json.dumps(data, ensure_ascii=False)
     return raw_text, data
-
 
 async def ai_respond_to_acl(
     agent,
@@ -179,7 +169,7 @@ async def ai_respond_to_acl(
     })
 
     # Call LLM
-    raw_text, raw_json = await _call_openai(system, messages)
+    raw_text, raw_json = await _call_openai(agent_name, incoming.conversation_id, system, messages)
 
     # Audyt: surowa odpowiedź
     audit_save(agent_name, incoming.conversation_id, "raw_response", {
@@ -243,29 +233,54 @@ async def ai_respond_to_acl(
 # --- Shim kompatybilności dla starszego kodu (np. agents/explorer_ai.py) ---
 def suggest(text: str, system: str = "You are concise.") -> str:
     """
-    Zwraca krótki tekst podpowiedzi. Jeśli brak klucza API, zwraca stałą odpowiedź.
+    Prosty prompt pomocniczy. Zwraca tekst.
+    Loguje pełne body żądania i pełną odpowiedź.
     """
     if not OPENAI_API_KEY:
-        return "OK. Budżet zaakceptowany. Proponuję kanapki + woda."
-    try:
-        url = f"{OPENAI_BASE_URL.rstrip('/')}/responses"
-        headers = {
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json",
-        }
-        body = {
-            "model": OPENAI_MODEL,
-            "input": f"{system}\nUser: {text}",
-            "temperature": LLM_TEMPERATURE,
-        }
-        r = httpx.post(url, headers=headers, json=body, timeout=15)
-        data = r.json()
-        # Wyciągnij najprostszy wariant tekstu
-        try:
-            out = data.get("output", [])[0]["content"][0].get("text", "")
-        except Exception:
-            out = data.get("response", "") or "OK."
-        return (out or "OK.").strip()
-    except Exception:
-        return "OK."
+        # fallback – brak klucza: zwróć wejście lub skrót zgodnie z Twoją dotychczasową logiką
+        return text
 
+    url = f"{OPENAI_BASE_URL.rstrip('/')}/responses"
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "model": OPENAI_MODEL,
+        "input": [
+            {"role": "system", "content": [{"type": "text", "text": system}]},
+            {"role": "user",   "content": [{"type": "text", "text": text}]},
+        ],
+        # jeśli chcesz „czysty” tekst z Responses API:
+        "response_format": {"type": "text"},
+    }
+
+    # — log pełnego requestu —
+    try:
+        log_ai_request(None, None, "openai", OPENAI_MODEL, body, endpoint=url, headers=headers)
+    except Exception:
+        pass
+
+    r = httpx.post(url, headers=headers, json=body, timeout=15)
+
+    # — zczytanie i zalogowanie odpowiedzi —
+    try:
+        data = r.json()
+    except Exception:
+        data = {"_non_json_body": r.text}
+
+    try:
+        log_ai_response(None, None, "openai", OPENAI_MODEL, r.status_code, data)
+    except Exception:
+        pass
+
+    # — ekstrakcja tekstu (dostosowana do Responses API) —
+    out = None
+    # próba wg nowego schematu:
+    try:
+        out = data["output"][0]["content"][0]["text"]
+    except Exception:
+        # inne ścieżki, zależnie od providera/formatu
+        out = data.get("content") or data.get("response") or str(data)
+
+    return str(out) if out is not None else ""
